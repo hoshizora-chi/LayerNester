@@ -1,5 +1,7 @@
 # LayerNester
 
+DISCLAIMER: THIS IS A PROTOTYPE-IN-PRODUCTION MADE BY OPENCODE BIG PICKLE. USE AT YOUR OWN RISK
+
 A Blender 5.2 add-on that takes over the visibility of a nested hierarchy so
 that only one branch is shown at a time. See [SPECS.md](SPECS.md).
 
