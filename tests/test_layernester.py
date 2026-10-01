@@ -20,7 +20,7 @@ _REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(_REPO_DIR))
 
 import LayerNester  # noqa: E402
-from LayerNester import nester  # noqa: E402
+from LayerNester import handlers, nester  # noqa: E402
 
 
 # ----------------------------------------------------------------------------
@@ -147,8 +147,15 @@ def refresh():
 
 
 def wipe():
+    # Animation and drivers have to go with the objects, and the frame has to
+    # go back to the start, or a leftover curve would drive the next test.
+    if bpy.data.actions:
+        for action in list(bpy.data.actions):
+            bpy.data.actions.remove(action)
+    bpy.context.scene.frame_set(1)
     for obj in list(bpy.data.objects):
         bpy.data.objects.remove(obj, do_unlink=True)
+    nester.rebuild_roots()
 
 
 # ----------------------------------------------------------------------------
@@ -832,6 +839,30 @@ def test_apply_all_operator():
     check(render_visible(child3), "apply_all restored Child 3 for render")
 
 
+@test
+def test_apply_all_operator_forces_the_write_by_itself():
+    """An explicit "Apply All" must not depend on a callback having run first.
+
+    Without the handlers the depsgraph path cannot quietly repair the flags, so
+    this fails if the operator lets the signature gate skip the write.
+    """
+    wipe()
+    parent, *_ = spec_hierarchy()
+    parent.layer_nester.enabled = True
+    set_levels(parent, *levels_for(parent, "Child 2"))
+    child2 = bpy.data.objects["Child 2"]
+
+    handlers.unregister()
+    try:
+        child2.hide_viewport = True
+        child2.hide_render = True
+        bpy.ops.layernester.apply_all()
+        check(viewport_visible(child2), "the operator restored the viewport flag")
+        check(render_visible(child2), "and the render flag")
+    finally:
+        handlers.register()
+
+
 # ----------------------------------------------------------------------------
 # Nested nesters
 
@@ -962,6 +993,256 @@ def test_rebuild_roots_finds_saved_nesters():
     nester.rebuild_roots()
     check_equal([obj.name for obj in nester.nester_roots()], ["Parent"],
                 "rebuild finds it again, as a file load would")
+
+
+# ----------------------------------------------------------------------------
+# Animation and drivers
+#
+# None of these can be reached by setting a property from Python, because that
+# runs the update callback and the whole point is that Blender does not run it
+# for an animated or driven value. So each one drives the real handler.
+
+
+def keyframe_level(parent, index, frame, value):
+    """Keyframe one level slider, as the animation editor would."""
+    level = parent.layer_nester.path[index]
+    level.value = value
+    level.keyframe_insert("value", frame=frame)
+
+
+def drive_level(parent, index, expression):
+    """Put a driver on one level slider."""
+    fcurve = parent.driver_add(f"layer_nester.path[{index}].value")
+    fcurve.driver.expression = expression
+    return fcurve
+
+
+def drive_level_from(parent, index, source, prop):
+    """Drive one level slider from a custom property on another object."""
+    fcurve = parent.driver_add(f"layer_nester.path[{index}].value")
+    driver = fcurve.driver
+    var = driver.variables.new()
+    var.name = "src"
+    var.type = "SINGLE_PROP"
+    var.targets[0].id = source
+    var.targets[0].data_path = f'["{prop}"]'
+    driver.expression = "src"
+    return fcurve
+
+
+@test
+def test_animated_level_drives_the_visibility():
+    """A keyframed slider has to move the visibility, not just its own value."""
+    wipe()
+    parent, *_ = spec_hierarchy()
+    parent.layer_nester.enabled = True
+    keyframe_level(parent, 0, 1, index_of(parent, "Child 4"))
+    keyframe_level(parent, 0, 2, index_of(parent, "Child Group 1"))
+
+    bpy.context.scene.frame_set(1)
+    check_equal(visible_names(parent), ["Child 4"], "frame 1 shows the first branch")
+
+    bpy.context.scene.frame_set(2)
+    check_equal(visible_names(parent), ["Child Group 1", "Child 1"],
+                "frame 2 shows the second branch")
+
+
+@test
+def test_animated_second_level_drives_the_visibility():
+    wipe()
+    parent, *_ = spec_hierarchy()
+    parent.layer_nester.enabled = True
+    group2 = index_of(parent, "Child Group 2")
+    parent.layer_nester.path[0].value = group2
+    keyframe_level(parent, 1, 1, index_of(parent, "Child 2", above=(group2,)))
+    keyframe_level(parent, 1, 2, index_of(parent, "Child 3", above=(group2,)))
+
+    bpy.context.scene.frame_set(1)
+    check_equal(visible_names(parent), ["Child 2"], "frame 1 picks the first leaf")
+
+    bpy.context.scene.frame_set(2)
+    check_equal(visible_names(parent), ["Child 3"], "frame 2 picks the second leaf")
+
+
+@test
+def test_animated_level_drives_the_render_flags():
+    wipe()
+    parent, *_ = spec_hierarchy()
+    parent.layer_nester.enabled = True
+    keyframe_level(parent, 0, 1, index_of(parent, "Child 4"))
+    keyframe_level(parent, 0, 2, index_of(parent, "Child Group 1"))
+
+    bpy.context.scene.frame_set(1)
+    shown = [obj.name for obj in nester.iter_subtree(parent)
+             if obj is not parent and render_visible(obj)]
+    check_equal(shown, ["Child 4"], "the render flags follow too")
+
+    bpy.context.scene.frame_set(2)
+    shown = [obj.name for obj in nester.iter_subtree(parent)
+             if obj is not parent and render_visible(obj)]
+    check_equal(shown, ["Child Group 1", "Child 1"], "on the next frame as well")
+
+
+@test
+def test_time_driven_driver_drives_the_visibility():
+    """A driver on the frame number only ever posts frame_change_post."""
+    wipe()
+    parent, *_ = spec_hierarchy()
+    parent.layer_nester.enabled = True
+    drive_level(parent, 0, "frame % 4")
+
+    bpy.context.scene.frame_set(1)
+    check_equal(visible_names(parent), ["Child 4"], "frame 1 gives level value 1")
+
+    bpy.context.scene.frame_set(2)
+    check_equal(visible_names(parent), ["Child Group 1", "Child 1"],
+                "frame 2 gives level value 2")
+
+    bpy.context.scene.frame_set(5)
+    check_equal(visible_names(parent), ["Child 4"], "and it wraps round")
+
+
+@test
+def test_dependency_driven_driver_drives_the_visibility():
+    """A driver fed by another object only ever posts depsgraph_update_post."""
+    wipe()
+    parent, *_ = spec_hierarchy()
+    parent.layer_nester.enabled = True
+    source = new_object("Driver Source")
+    source["level"] = index_of(parent, "Child 4")
+    drive_level_from(parent, 0, source, "level")
+    refresh()
+    check_equal(visible_names(parent), ["Child 4"], "the driver's first value applied")
+
+    source["level"] = index_of(parent, "Child Group 1")
+    source.update_tag()
+    refresh()
+    check_equal(visible_names(parent), ["Child Group 1", "Child 1"],
+                "and it follows when the source changes")
+
+
+@test
+def test_driven_disable_hands_the_branch_back():
+    """Switching off without the update callback must still un-hide.
+
+    Only a driver can reach this state. Authoring a keyframe means setting the
+    value, and that runs the callback, so a keyframed nester has already been
+    released by the time playback switches it off.
+    """
+    wipe()
+    parent, *_ = spec_hierarchy()
+    parent.layer_nester.enabled = True
+    set_levels(parent, *levels_for(parent, "Child 1"))
+    check_equal(visible_names(parent), ["Child 1"], "hidden while it is on")
+
+    parent.driver_add("layer_nester.enabled").driver.expression = "frame < 2"
+
+    bpy.context.scene.frame_set(2)
+    check_equal(parent.layer_nester.enabled, False, "the driver switched it off")
+    check_equal(len(visible_names(parent)), 6, "and every descendant is handed back")
+
+    bpy.context.scene.frame_set(1)
+    check_equal(parent.layer_nester.enabled, True, "switched on again")
+    check_equal(visible_names(parent), ["Child 1"], "and the levels apply once more")
+
+
+@test
+def test_a_nester_switched_on_only_by_animation_is_found():
+    """A keyframed toggle never runs the update callback that registers it."""
+    wipe()
+    parent, *_ = spec_hierarchy()
+    parent.layer_nester.enabled = True
+    parent.keyframe_insert(data_path="layer_nester.enabled", frame=10)
+    parent.layer_nester.enabled = False
+    parent.keyframe_insert(data_path="layer_nester.enabled", frame=1)
+    nester.unregister_root(parent)
+
+    check_equal(nester.nester_roots(), [], "nothing is tracked to begin with")
+    set_levels(parent, *levels_for(parent, "Child 1"))
+
+    bpy.context.scene.frame_set(10)
+    check_equal(parent.layer_nester.enabled, True, "the keyframe switched it on")
+    check_equal(len(nester.nester_roots()), 1, "and the sweep found it")
+    check_equal(visible_names(parent), ["Child 1"], "so the levels take effect")
+
+
+@test
+def test_scan_enabled_is_throttled():
+    """The discovery sweep walks every object, so it must not run per frame."""
+    wipe()
+    parent, *_ = spec_hierarchy()
+    nester.rebuild_roots()  # resets the throttle
+
+    check_equal(nester.scan_enabled(now=1000.0), False, "nothing enabled yet")
+
+    parent.layer_nester.enabled = True
+    nester.unregister_root(parent)
+    check_equal(nester.scan_enabled(now=1001.0), True, "it finds the nester")
+    check_equal(nester.scan_enabled(now=1001.1), False, "not again straight away")
+
+    nester.unregister_root(parent)
+    check_equal(nester.scan_enabled(now=1002.0), True,
+                "but again once the interval has passed")
+
+
+@test
+def test_unchanged_settings_skip_the_write():
+    """The per frame path pays for a walk only when the settings moved."""
+    wipe()
+    parent, *_ = spec_hierarchy()
+    parent.layer_nester.enabled = True
+    set_levels(parent, *levels_for(parent, "Child 1"))
+
+    out_of_step = bpy.data.objects["Child Group 2"]
+    out_of_step.hide_viewport = False
+
+    nester.apply_all()
+    check_equal(out_of_step.hide_viewport, False,
+                "an unforced apply leaves unchanged settings alone")
+
+    nester.apply_all(force=True)
+    check_equal(out_of_step.hide_viewport, True, "a forced apply puts them back")
+
+
+@test
+def test_signature_notices_a_changed_child_count():
+    """A new child moves no level value, so the counts are what reveal it."""
+    wipe()
+    parent, *_ = spec_hierarchy()
+    parent.layer_nester.enabled = True
+    set_levels(parent, *levels_for(parent, "Child 2"))
+    check_equal(visible_names(parent), ["Child 2"], "applied")
+
+    new_object("Child 5", parent_of(parent, "Child Group 2"))
+    nester.sync_limits(parent)
+    check_equal(parent.layer_nester.path[1].child_count, 3,
+                "one more child under the branch level 1 points at")
+    check_equal(parent.layer_nester.level_values(), [3, 1], "and no level value moved")
+
+    nester.apply_all()
+    check("Child 5" not in visible_names(parent),
+          "the new child is hidden even though no level value moved")
+
+
+@test
+def test_both_handlers_are_registered_once_and_fully_removed():
+    """Both are needed: keyframes post one, drivers the other."""
+    pairs = ((bpy.app.handlers.depsgraph_update_post, handlers._on_depsgraph_update),
+             (bpy.app.handlers.frame_change_post, handlers._on_frame_change),
+             (bpy.app.handlers.load_post, handlers._on_load))
+
+    def count(handler_list, fn):
+        return sum(1 for handler in handler_list if handler == fn)
+
+    for handler_list, fn in pairs:
+        check_equal(count(handler_list, fn), 1, f"{fn.__name__} registered once")
+
+    handlers.unregister()
+    try:
+        for handler_list, fn in pairs:
+            check_equal(count(handler_list, fn), 0, f"{fn.__name__} fully removed")
+    finally:
+        handlers.register()
 
 
 # ----------------------------------------------------------------------------

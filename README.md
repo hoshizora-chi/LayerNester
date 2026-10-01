@@ -94,6 +94,37 @@ picks up the extra sliders itself, but it never takes any away. **Rescan Nest
 Depth** is the explicit way to shrink it back down. Until you rescan, the
 panel shows a warning when the hierarchy is deeper than the slider count.
 
+## Animation and drivers
+
+The sliders can be keyframed or driven, and the visibility follows during
+playback. Nothing extra is needed: put a keyframe on a slider, or add a driver
+to it, and scrub or play.
+
+This works because Blender treats a driven value differently from an edited one.
+An `update` callback — which is how an edit made in the panel is noticed — is
+never called for a keyframed or driven value, so watching only for edits would
+miss animation completely. LayerNester therefore also listens on Blender's two
+change handlers, which between them report every case:
+
+| What changed | What reports it |
+| --- | --- |
+| Edited by hand in the panel or from a script | the property's `update` callback |
+| Keyframes, or a driver on the frame number | `frame_change_post` |
+| A driver fed from another object's property | `depsgraph_update_post` |
+| Children added, removed or re-parented | `depsgraph_update_post` |
+| File loaded | `load_post` |
+
+Both handlers also look for a nester that was switched **on** by animation or a
+driver, since that never reaches the callback which normally registers it. That
+search walks every object in the file, so it is throttled to at most one walk
+every half second; in practice a freshly animated toggle picks up within a frame
+or two. Switching a nester **off** by animation hands the branch back just as a
+hand edit does.
+
+One caveat worth knowing: on a frame where nothing relevant changed, LayerNester
+does nothing at all, rather than re-walking the subtree. On a large tree that
+is the difference between a free frame and a visible hitch.
+
 ## Nested nesters
 
 A nester can be switched on for a child of another nester. The inner one is
@@ -106,7 +137,7 @@ when a rig has a global nester and per-part nesters underneath it.
 __init__.py     bl_info, registration
 nester.py       the resolution rule, depth scanning, visibility writes
 properties.py   Object.layer_nester and the per level slider storage
-handlers.py     keeps sliders and hide flags in step with hierarchy edits
+handlers.py     the two change handlers, animation and hierarchy edits
 operators.py    Show All, Rescan Nest Depth, Select Visible, Apply All
 ui.py           the two panels
 tests/          headless tests
@@ -120,7 +151,7 @@ blender -b --factory-startup --python tests/test_install.py
 ```
 
 `test_layernester.py` covers the rule against the SPECS.md examples, deeper
-trees, clamping, the slider count, the options, the operators, nested nesters
-and the handlers. `test_install.py` installs the add-on the way a user would,
+trees, clamping, the slider count, the options, the operators, nested nesters,
+keyframes, drivers and the handlers. `test_install.py` installs the add-on the way a user would,
 then saves and reloads a file to check the state survives. The tests write
 nothing to your Blender configuration and clean up after themselves.

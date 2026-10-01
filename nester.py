@@ -33,6 +33,8 @@ the behaviour SPECS.md asks for, and only one child is visible at a time.
 
 from __future__ import annotations
 
+import time
+
 import bpy
 
 # Safety net for pathologically deep hierarchies, so a generated parent chain
@@ -49,13 +51,17 @@ _busy = False
 # which would make a set entry unreachable and leak forever.
 _roots: dict[int, object] = {}
 
-# Which hide channels each root currently owns. Keyed by object pointer and
-# paired with the object itself, because Blender recycles pointers and a fresh
-# object must not inherit a deleted one's state. This is runtime state rather
-# than file data, and it exists so that switching a channel off hands the flags
-# back exactly once instead of on every depsgraph update, which would otherwise
-# fight the user over manual hides.
-_managed: dict[int, tuple[object, dict[str, bool]]] = {}
+# Which hide channels each root currently owns, plus the settings that produced
+# them. Keyed by object pointer and paired with the object itself, because
+# Blender recycles pointers and a fresh object must not inherit a deleted one's
+# state. This is runtime state rather than file data, and it exists so that
+# switching a channel off hands the flags back exactly once instead of on every
+# depsgraph update, which would otherwise fight the user over manual hides, and
+# so that a repeat apply with unchanged settings can be skipped.
+_managed: dict[int, tuple[object, dict[str, bool], tuple]] = {}
+
+# Wall clock of the last sweep for enabled nesters, see scan_enabled.
+_last_scan = 0.0
 
 _CHANNELS = ("use_viewport", "use_render")
 
@@ -321,6 +327,34 @@ def _channels(root):
     return {name: bool(getattr(settings, name)) for name in _CHANNELS}
 
 
+def _signature(root):
+    """Everything a write depends on, as a comparable value.
+
+    The hide flags are a pure function of the level values, the parent option
+    and the channels, but the child counts matter too: a child added at a level
+    that is already there leaves every level value untouched while still needing
+    the new object hidden.  ``sync_limits`` maintains those counts, so comparing
+    them is how a repeat apply notices the subtree changed without walking it.
+    """
+    settings = root.layer_nester
+    return (
+        tuple(level.value for level in settings.path),
+        tuple(level.child_count for level in settings.path),
+        settings.depth,
+        settings.computed_depth,
+        settings.show_parents,
+        tuple(_channels(root)[name] for name in _CHANNELS),
+    )
+
+
+def _last_signature(root):
+    """The signature behind the flags currently on screen, or ``None``."""
+    entry = _managed.get(root.as_pointer())
+    if entry is None or entry[0] is not root:
+        return None
+    return entry[2]
+
+
 def _previous_channels(root):
     """The channels this root owned on its last write, or ``None``."""
     entry = _managed.get(root.as_pointer())
@@ -358,6 +392,7 @@ def _write(root):
     settings = root.layer_nester
     previous = _previous_channels(root)
     channels = _channels(root)
+    signature = _signature(root)
     visible = None
     released = set()
     for channel, on in channels.items():
@@ -386,15 +421,31 @@ def _write(root):
                 if obj.hide_render != wanted:
                     obj.hide_render = wanted
 
-    _managed[root.as_pointer()] = (root, channels)
+    _managed[root.as_pointer()] = (root, channels, signature)
 
 
-def apply(root):
-    """Push ``root``'s level values onto its descendants' visibility flags."""
+def _apply_locked(root, force=False):
+    """Gate the write on the signature. The caller must already hold the busy flag."""
+    signature = _signature(root)
+    if not force and _last_signature(root) == signature:
+        return
+    _write(root)
+
+
+def apply(root, force=False):
+    """Push ``root``'s level values onto its descendants' visibility flags.
+
+    ``force`` writes even when nothing that matters has changed.  The caller
+    that reacts to hierarchy edits wants that, because an edit can move an
+    object between branches without altering any level value.  The caller that
+    runs on every animation frame does not: a frame where the settings happen to
+    match the ones already on screen is the common case, and skipping it keeps
+    a playing animation from walking the subtree for nothing.
+    """
     if _busy or not root.layer_nester.enabled:
         return
     with _Busy():
-        _write(root)
+        _apply_locked(root, force=force)
 
 
 def release(root):
@@ -417,7 +468,7 @@ def nester_roots():
     are nested.
 
     Only objects that were switched on at some point are looked at, so this
-    stays cheap enough to call on every depsgraph update.
+    stays cheap enough to call on every frame.
     """
     roots = []
     for key, obj in list(_roots.items()):
@@ -426,9 +477,55 @@ def nester_roots():
             _managed.pop(key, None)
         elif obj.layer_nester.enabled:
             roots.append(obj)
+        elif key in _managed:
+            # Tracked but now switched off. Switch it off by hand and the update
+            # callback has already released it; switch it off through animation
+            # or a driver and that callback never runs, so release it here or
+            # the hides would be left in place. Staying tracked means switching
+            # it back on needs no new sweep.
+            release(obj)
 
     roots.sort(key=hierarchy_level)
     return roots
+
+
+def scan_enabled(max_interval=0.5, now=None):
+    """Register nesters that were switched on without the update callback.
+
+    Animation and drivers change property values without ever running an
+    ``update`` callback, so an object whose ``enabled`` flag is animated is
+    never registered by that path and the frame handler would never look at it.
+    This walks every object in the file, which is too much to do on every
+    depsgraph update, so it is throttled to one walk per ``max_interval``
+    seconds. Returns True when it registered something.
+    """
+    global _last_scan
+    if now is None:
+        now = time.monotonic()
+    if now - _last_scan < max_interval:
+        return False
+    _last_scan = now
+
+    fresh = []
+    for obj in bpy.data.objects:
+        try:
+            if not obj.layer_nester.enabled:
+                continue
+        except (ReferenceError, AttributeError):
+            continue
+        key = obj.as_pointer()
+        if _roots.get(key) is not obj:
+            _roots[key] = obj
+            fresh.append(obj)
+
+    if fresh:
+        with _Busy():
+            for obj in fresh:
+                # An object enabled by animation has no sliders yet, so give it
+                # the same set an interactive enable would have given it.
+                set_depth(obj, subtree_depth(obj))
+                sync_limits(obj)
+    return bool(fresh)
 
 
 def register_root(obj):
@@ -443,6 +540,8 @@ def unregister_root(obj):
 
 def rebuild_roots():
     """Rebuild the tracked set from scratch, used after loading a file."""
+    global _last_scan
+    _last_scan = 0.0
     _roots.clear()
     _managed.clear()
     for obj in bpy.data.objects:
@@ -453,10 +552,14 @@ def rebuild_roots():
             continue
 
 
-def apply_all():
-    """Re-apply every enabled nester in the file."""
+def apply_all(force=False):
+    """Re-apply every enabled nester in the file.
+
+    Called on every animation frame, so it skips roots whose settings have not
+    moved since the last write.
+    """
     if _busy:
         return
     with _Busy():
         for root in nester_roots():
-            _write(root)
+            _apply_locked(root, force=force)

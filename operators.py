@@ -34,7 +34,7 @@ class LAYERNESTER_OT_rescan(Operator):
 
         for root in roots:
             nester.scan_depth(root, grow_only=False)
-        nester.apply_all()
+        nester.apply_all(force=True)
 
         if len(roots) == 1:
             self.report({"INFO"},
@@ -61,7 +61,7 @@ class LAYERNESTER_OT_release(Operator):
         for root in roots:
             for level in root.layer_nester.path:
                 level.value = 0
-        nester.apply_all()
+        nester.apply_all(force=True)
         return {"FINISHED"}
 
 
@@ -74,7 +74,7 @@ class LAYERNESTER_OT_apply_all(Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        nester.apply_all()
+        nester.apply_all(force=True)
         return {"FINISHED"}
 
 
