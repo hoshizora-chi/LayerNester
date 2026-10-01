@@ -156,6 +156,52 @@ def wipe():
 
 
 @test
+def test_level_one_updates_on_every_single_change():
+    """Each step of a drag must take effect, not only the last one."""
+    wipe()
+    parent, *_ = spec_hierarchy()
+    parent.layer_nester.enabled = True
+
+    check_equal([obj.name for obj in parent.children],
+                ["Child 4", "Child Group 1", "Child Group 2"],
+                "level values index the outliner order")
+
+    # Asserted inside the loop on purpose: a check that only looked at the
+    # final value would pass even if the intermediate steps never applied.
+    for value, expected in ((1, ["Child 4"]),
+                            (2, ["Child Group 1", "Child 1"]),
+                            (3, ["Child Group 2", "Child 2", "Child 3"])):
+        parent.layer_nester.path[0].value = value
+        check_equal(visible_names(parent), expected,
+                    f"level 1 at {value} applied immediately")
+
+    parent.layer_nester.path[0].value = 0
+    check_equal(len(visible_names(parent)), 6, "and zero still shows everything")
+
+
+@test
+def test_level_two_updates_on_every_single_change():
+    wipe()
+    parent, *_ = spec_hierarchy()
+    parent.layer_nester.enabled = True
+    group2_value = index_of(parent, "Child Group 2")
+    parent.layer_nester.path[0].value = group2_value
+
+    # show_parents is off, so the group itself stays hidden while descending.
+    for value, expected in ((1, ["Child 2"]),
+                            (2, ["Child 3"]),
+                            (3, ["Child 3"])):  # clamps, Child Group 2 has 2 children
+        parent.layer_nester.path[1].value = value
+        check_equal(visible_names(parent), expected,
+                    f"level 2 at {value} applied immediately")
+
+    parent.layer_nester.path[1].value = 0
+    check_equal(visible_names(parent),
+                ["Child Group 2", "Child 2", "Child 3"],
+                "zero on level 2 shows the whole group again")
+
+
+@test
 def test_slider_count_matches_deepest_nest():
     """The amount of sliders is the highest nest in the group."""
     wipe()

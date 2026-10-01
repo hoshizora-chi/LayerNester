@@ -349,21 +349,42 @@ def _write_channel(root, visible, channel):
 
 
 def _write(root):
+    """Push ``root``'s level values onto the hide flags of every descendant.
+
+    Both channels are handled in one pass over the subtree. This runs on every
+    value change, so while dragging a slider it runs once per step and a second
+    walk is not free.
+    """
     settings = root.layer_nester
     previous = _previous_channels(root)
     channels = _channels(root)
     visible = None
-
+    released = set()
     for channel, on in channels.items():
         if on:
             if visible is None:
                 visible = {obj.as_pointer() for obj in resolve(
                     root, settings.level_values(), settings.show_parents)}
-            _write_channel(root, visible, channel)
         elif previous is not None and previous.get(channel):
             # Switched off since the last write, so release it once. Doing this
             # on every apply instead would undo the user's own hides.
-            _write_channel(root, None, channel)
+            released.add(channel)
+
+    if visible is not None or released:
+        free_viewport = "use_viewport" in released
+        free_render = "use_render" in released
+        for obj in iter_subtree(root):
+            if obj is root:
+                continue
+            hidden = visible is not None and obj.as_pointer() not in visible
+            if channels["use_viewport"] or free_viewport:
+                wanted = False if free_viewport else hidden
+                if obj.hide_viewport != wanted:
+                    obj.hide_viewport = wanted
+            if channels["use_render"] or free_render:
+                wanted = False if free_render else hidden
+                if obj.hide_render != wanted:
+                    obj.hide_render = wanted
 
     _managed[root.as_pointer()] = (root, channels)
 
